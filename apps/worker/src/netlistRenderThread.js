@@ -2,11 +2,12 @@
 // recurses deeply on wide buses, and the thread gets a larger stack than the main one.
 import { parentPort, workerData } from 'worker_threads';
 import netlistsvg from 'netlistsvg';
+import { escapeNetlistForSvg } from './svgNetlist.js';
 
 const { skin, netlist } = workerData;
 
 Promise.resolve()
-  .then(() => netlistsvg.render(skin, netlist))
+  .then(() => netlistsvg.render(skin, escapeNetlistForSvg(netlist)))
   .then(
     svg => parentPort.postMessage({ svg }),
     err => parentPort.postMessage({ error: err?.message || String(err) })
