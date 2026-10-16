@@ -2,7 +2,7 @@
 
 Date: 16 October 2026
 
-Scope: targeted source review of request validation, simulation execution, artifact processing, and SVG delivery; isolated worker-function, input-coercion, rendering, and Mongoose query-casting tests; a local Chromium SVG/Blob execution test; a user-reported live query-selector PoC; public advisories matched against the supplied kernel string. This is not a complete audit. Running containers, effective host security policies, and livepatch state could not be inspected. No container escape was attempted or demonstrated.
+Scope: targeted source review of request validation, authentication, simulation execution, artifact processing, and SVG delivery; isolated worker-function, input-coercion, rendering, and Mongoose query-casting tests; local authentication, concurrency, and quota checks using actual handlers/services with mocked dependencies; a local Chromium SVG/Blob execution test; a user-reported live query-selector PoC; public advisories matched against the supplied kernel string. This is not a complete audit. Running containers, effective host security policies, and livepatch state could not be inspected. No container escape was attempted or demonstrated.
 
 ## User execution capabilities
 
@@ -124,6 +124,46 @@ The named-pipe issue in finding 2 also prevents the simulation runner from reach
 
 **Remediation:** await directory deletion and surface/retry failures; track active containers and reconcile abandoned jobs with an independent deadline/cleanup mechanism. Confirm container termination before removing mounted job files. Reset account-specific browser state on logout/account changes and define how local drafts are retained; account-specific storage keys alone do not make browser storage confidential. Delete all versions within the authenticated user's scope when a full module deletion is requested. Invalidate pending artifact loads on unmount and revoke any URLs created after cancellation.
 
+### 11. Tokens issued in the password-change second survive invalidation
+
+**Confirmed in an isolated middleware test with verified-token claims and user lookup mocked.** `apps/backend/src/middleware/auth.js:29` rounds `passwordChangedAt` down to whole seconds and rejects tokens only when `decoded.iat < changedAt`. A token issued before the password change, but within the same second, therefore remains accepted. The test confirmed that same-second claims were accepted while prior-second claims were rejected. JWT signature verification was not under test.
+
+Password reset and GitLab account linking both use this invalidation mechanism. A previously obtained token from that narrow time window can remain usable until its seven-day expiry, unless a later credential change or account deletion invalidates it. This does not allow an attacker to forge a token or bypass password verification.
+
+**Remediation:** include an account session-version counter in tokens and compare it with the current database value on every authenticated request. Atomically increment it when resetting credentials or linking accounts so invalidation does not depend on timestamp precision.
+
+### 12. A password-reset token can be redeemed concurrently more than once
+
+**Confirmed using the actual reset handler with mocked database snapshots and password hashing.** `apps/backend/src/routes/auth.js:233` looks up the reset-token hash and expiry, then hashes the replacement password and saves the user separately. Two concurrent requests can both read the valid token before either clears it. Both local test requests returned success, and the later save determined the password.
+
+This violates the intended single-use guarantee. Exploitation requires possession of a valid reset token and racing its redemption; no token disclosure, guessing, or unauthenticated account takeover was demonstrated. A sequential reuse after the token is cleared remains rejected.
+
+**Remediation:** atomically match the token hash and unexpired deadline, set the replacement password, consume the token, and invalidate existing sessions. Only the request that successfully updates the matching record should return success. [OWASP password-reset guidance](https://cheatsheetseries.owasp.org/cheatsheets/Forgot_Password_Cheat_Sheet.html) recommends single-use reset tokens.
+
+### 13. Concurrent login attempts exceed the intended failure limits
+
+**Confirmed using the actual login handler and limiter with mocked user lookup and asynchronous password comparison.** `apps/backend/src/routes/auth.js:129` checks the account/IP failure counters before database lookup and password comparison, but increments them only after those asynchronous operations fail. Concurrent attempts can all pass the initial check before any failure is recorded.
+
+Twelve simultaneous invalid attempts against one username all reached password comparison and returned HTTP 401 despite the ten-failure account threshold; a subsequent request returned HTTP 429. This permits additional guesses and expensive password comparisons within a concurrent burst. It does not make the limiter ineffective against later requests or demonstrate successful login.
+
+**Remediation:** reserve attempt capacity before asynchronous work and enforce a separate bound on concurrent password comparisons. Apply account and IP controls consistently, using shared atomic state if the backend runs in multiple processes.
+
+### 14. Concurrent submissions exceed the active-simulation quota
+
+**Confirmed using the actual simulation service with mocked database and queue operations.** `apps/backend/src/services/simulations.js:101` counts active simulations separately from inserting and queuing the next simulation. Starting with five active records, two concurrent calls both passed the six-active-simulation check, resulting in seven records and two queued messages.
+
+The account quota therefore does not reliably bound outstanding submissions under concurrency. Worker concurrency and container resource limits remain effective; this finding concerns queue admission and fairness rather than unrestricted simultaneous container execution.
+
+**Remediation:** atomically reserve per-account capacity before creating and queuing a simulation. Release reservations on completion/failure and reconcile abandoned reservations after crashes. Retain request rate limits as an additional control.
+
+### 15. Module version updates bypass the total document quota
+
+**Confirmed using the actual PATCH handler with mocked module storage and pruning queries.** `POST /modules` checks the 1,000-document account limit, but `PATCH /modules/:moduleName` in `apps/backend/src/routes/tutorial.js:245` creates a new version without applying that limit. A local test starting at 1,000 documents accepted a PATCH and increased the total to 1,001 without invoking the quota check.
+
+The twenty-version limit per module name still applies. However, updates across existing module names can exceed the intended total storage allowance. Ownership checks remain present; this is a storage-abuse control gap, not access to another user's modules.
+
+**Remediation:** enforce a common, concurrency-safe account storage quota across both creation and version-update paths. Account for versions removed by pruning and release storage reservations when records are deleted.
+
 ## What is implemented well
 
 - Each job gets a separate container and job-directory mount. Submissions receive neither the worker's Docker socket nor its application credentials.
@@ -157,9 +197,9 @@ These are proposed checks, not additional confirmed vulnerabilities. They extend
 | --- | --- | --- |
 | 1 | Effective production isolation | Inspect actual container mounts, capabilities, seccomp/AppArmor policies, network reachability, kernel/runtime patches, and separation from application/database infrastructure. Compare deployed settings with the repository configuration. |
 | 2 | Worker and queue permissions | Check whether backend/worker credentials can publish arbitrary jobs, access unrelated database collections, or control the Docker daemon. Establish the minimum permissions needed by each component. |
-| 3 | Resource exhaustion and concurrency | Test simultaneous submissions against account limits, queue saturation, many-account abuse, total disk/inode consumption, and expensive netlist/VCD parsing. Verify limits during failures and restarts. |
+| 3 | Resource exhaustion and concurrency | Verify fixes for the isolated admission/quota bypasses in findings 14–15 against real concurrent database requests. Test queue saturation, many-account abuse, total disk/inode consumption, and expensive netlist/VCD parsing. Verify limits during failures and restarts. |
 | 4 | Cross-account access | Use two test accounts to exchange project, simulation, artifact, and module identifiers. Verify ownership on reads, modifications, and deletions, including malformed selectors and missing resources. |
-| 5 | Account and session lifecycle | Test password-reset token reuse and concurrent redemption, session invalidation after password changes, OAuth account linking, logout behavior, and account enumeration. |
+| 5 | Account and session lifecycle | Verify fixes for findings 11–13 with real tokens, password hashing, and concurrent database requests. Extend coverage to OAuth account linking, logout behavior, and account enumeration. |
 | 6 | Hostile file handling | Test ZIP traversal, decompression bombs, duplicate/reserved filenames, symlinks, hard links, special files, and deeply nested or malformed artifacts. Include processing outside the simulation container. |
 | 7 | Dependencies and build pipeline | Review native tools, npm/Python packages, container images, tutorial synchronization, CI permissions, and possible secret exposure through build contexts or frontend bundles. |
 | 8 | Detection and recovery | Verify alerts for failed cleanup, abnormal job duration, disk pressure, repeated crashes, and rejected requests. Test backup restoration and check that logs avoid unnecessary credentials and submitted source. |
